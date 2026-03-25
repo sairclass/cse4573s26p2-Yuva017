@@ -14,6 +14,7 @@ from utils import show_image
 Please do NOT add any imports. The allowed libraries are already imported for you.
 '''
 
+# Helper function for Task 1
 def img_to_float(img: torch.Tensor) -> torch.Tensor:
     if img.dtype == torch.uint8:
         return img.float() / 255.0
@@ -194,13 +195,18 @@ def estimate_homography_ransac(src_points: torch.Tensor, dst_points: torch.Tenso
 
 
 def estimate_pairwise_homography(image_a: torch.Tensor,
-                                 image_b: torch.Tensor):
+                                 image_b: torch.Tensor,
+                                 max_k: int = 1500,
+                                 ratio: float = 0.75,
+                                 num_iters: int = 2000,
+                                 inlier_thresh: float = 3.0,
+                                 force_affine: bool = False):
 
-    keypoints_a, descriptors_a, _ = detect_and_describe_features(image_a)
-    keypoints_b, descriptors_b, _ = detect_and_describe_features(image_b)
+    keypoints_a, descriptors_a, _ = detect_and_describe_features(image_a, max_k=max_k)
+    keypoints_b, descriptors_b, _ = detect_and_describe_features(image_b, max_k=max_k)
 
     match_idx_a, match_idx_b = match_feature_descriptors(
-        descriptors_a, descriptors_b
+        descriptors_a, descriptors_b, ratio=ratio
     )
 
     if match_idx_a.numel() < 4:
@@ -208,42 +214,19 @@ def estimate_pairwise_homography(image_a: torch.Tensor,
 
     homography_b_to_a, inlier_mask = estimate_homography_ransac(
         keypoints_b[match_idx_b],
-        keypoints_a[match_idx_a]
+        keypoints_a[match_idx_a],
+        num_iters=num_iters,
+        inlier_thresh=inlier_thresh
     )
+
+    if force_affine:
+        homography_b_to_a = homography_b_to_a.clone()
+        homography_b_to_a[2, 0] = 0.0
+        homography_b_to_a[2, 1] = 0.0
+        homography_b_to_a[2, 2] = 1.0
 
     inlier_count = int(inlier_mask.sum().item()) if inlier_mask is not None else 0
     return homography_b_to_a, inlier_count
-
-def compute_panorama_canvas(image_list, homographies_to_ref):
-
-    all_warped_corners = []
-    for img, H in zip(image_list, homographies_to_ref):
-        _, h, w = img.shape
-
-        image_corners = torch.tensor([
-            [0., 0.],
-            [w - 1., 0.],
-            [w - 1., h - 1.],
-            [0., h - 1.]
-        ])
-
-        warped_corners = project_points_homography(H, image_corners)
-        all_warped_corners.append(warped_corners)
-
-    all_warped_corners = torch.cat(all_warped_corners, dim=0)
-    min_coords = torch.floor(all_warped_corners.min(dim=0).values)
-    max_coords = torch.ceil(all_warped_corners.max(dim=0).values)
-    translate_x = -min_coords[0]
-    translate_y = -min_coords[1]
-    out_width = int((max_coords[0] - min_coords[0] + 1).item())
-    out_height = int((max_coords[1] - min_coords[1] + 1).item())
-
-    translation_matrix = torch.tensor([
-        [1., 0., translate_x],
-        [0., 1., translate_y],
-        [0., 0., 1.]
-    ])
-    return translation_matrix, out_height, out_width
 
 def warp_image_with_homography(input_image: torch.Tensor,
                                homography_matrix: torch.Tensor,
@@ -347,7 +330,7 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
     keys = sorted(list(imgs.keys()))
     img1, img2 = imgs[keys[0]], imgs[keys[1]]
 
-    H_2_to_1, score = estimate_pairwise_homography(img1, img2)
+    H_2_to_1, score = estimate_pairwise_homography(img1, img2, max_k=1500, ratio=0.75, num_iters=2000, inlier_thresh=3.0, force_affine=False)
     if H_2_to_1 is None:
         h = max(img1.shape[1], img2.shape[1])
         w = img1.shape[2] + img2.shape[2]
@@ -365,6 +348,53 @@ def stitch_background(imgs: Dict[str, torch.Tensor]):
 
     return img
 
+# Helper function for Task 2
+def compute_panorama_canvas(image_list, homographies_to_ref):
+
+    all_warped_corners = []
+    for img, H in zip(image_list, homographies_to_ref):
+        _, h, w = img.shape
+
+        image_corners = torch.tensor([
+            [0., 0.],
+            [w - 1., 0.],
+            [w - 1., h - 1.],
+            [0., h - 1.]
+        ])
+
+        warped_corners = project_points_homography(H, image_corners)
+        all_warped_corners.append(warped_corners)
+
+    all_warped_corners = torch.cat(all_warped_corners, dim=0)
+    min_coords = torch.floor(all_warped_corners.min(dim=0).values)
+    max_coords = torch.ceil(all_warped_corners.max(dim=0).values)
+    translate_x = -min_coords[0]
+    translate_y = -min_coords[1]
+    out_width = int((max_coords[0] - min_coords[0] + 1).item())
+    out_height = int((max_coords[1] - min_coords[1] + 1).item())
+
+    translation_matrix = torch.tensor([
+        [1., 0., translate_x],
+        [0., 1., translate_y],
+        [0., 0., 1.]
+    ])
+    return translation_matrix, out_height, out_width
+
+def average_blend_panorama(warped_images, warped_masks):
+    output_height, output_width = warped_masks[0].shape
+
+    accumulated_image = torch.zeros((3, output_height, output_width), dtype=warped_images[0].dtype)
+    accumulated_weight = torch.zeros((1, output_height, output_width), dtype=warped_images[0].dtype)
+
+    for warped_img, valid_mask in zip(warped_images, warped_masks):
+        mask_float = valid_mask.float().unsqueeze(0)
+        accumulated_image = accumulated_image + warped_img * mask_float
+        accumulated_weight = accumulated_weight + mask_float
+
+    blended_image = accumulated_image / accumulated_weight.clamp_min(1e-6)
+
+    return (blended_image.clamp(0.0, 1.0) * 255.0).byte()
+
 # ------------------------------------ Task 2 ------------------------------------ #
 def panorama(imgs: Dict[str, torch.Tensor]):
     """
@@ -374,9 +404,70 @@ def panorama(imgs: Dict[str, torch.Tensor]):
         img: panorama, 
         overlap: torch.Tensor of the output image. 
     """
-    img = torch.zeros((3, 256, 256)) # assumed 256*256 resolution. Update this as per your logic.
-    overlap = torch.empty((3, 256, 256)) # assumed empty 256*256 overlap. Update this as per your logic.
+    image_names = sorted(list(imgs.keys()))
+    image_list = [imgs[name] for name in image_names]
+    num_images = len(image_list)
 
-    #TODO: Add your code here. Do not modify the return and input arguments.
+    overlap = torch.eye(num_images, dtype=torch.int64)
+    adjacent_homographies = [None] * (num_images - 1)
+
+    for i in range(num_images - 1):
+        H_next_to_curr, inlier_count = estimate_pairwise_homography(
+            image_list[i], image_list[i + 1],
+            max_k=3800, ratio=0.8,
+            num_iters=2000,
+            inlier_thresh=2.0,
+            force_affine=False
+        )
+
+        if H_next_to_curr is not None and inlier_count >= 7:
+            adjacent_homographies[i] = H_next_to_curr
+            overlap[i, i + 1] = 1
+            overlap[i + 1, i] = 1
+        else:
+            adjacent_homographies[i] = None
+            overlap[i, i + 1] = 0
+            overlap[i + 1, i] = 0
+
+    ref_idx = 1
+    homographies_to_ref = [None] * num_images
+    homographies_to_ref[ref_idx] = torch.eye(3)
+
+    for i in range(ref_idx - 1, -1, -1):
+        H_right_to_left = adjacent_homographies[i]
+        if H_right_to_left is None or homographies_to_ref[i + 1] is None:
+            homographies_to_ref[i] = None
+        else:
+            homographies_to_ref[i] = homographies_to_ref[i + 1] @ torch.linalg.inv(H_right_to_left)
+
+    for i in range(ref_idx, num_images - 1):
+        H_next_to_curr = adjacent_homographies[i]
+        if H_next_to_curr is None or homographies_to_ref[i] is None:
+            homographies_to_ref[i + 1] = None
+        else:
+            homographies_to_ref[i + 1] = homographies_to_ref[i] @ H_next_to_curr
+
+    valid_images = []
+    valid_homographies = []
+    for i in range(num_images):
+        if homographies_to_ref[i] is not None:
+            valid_images.append(image_list[i])
+            valid_homographies.append(homographies_to_ref[i])
+
+    if len(valid_images) == 0:
+        return image_list[0], overlap
+
+    translation_matrix, out_h, out_w = compute_panorama_canvas(valid_images, valid_homographies)
+
+    warped_images = []
+    warped_masks = []
+    for img_i, H_i in zip(valid_images, valid_homographies):
+        warped_img, valid_mask = warp_image_with_homography(
+            img_i, translation_matrix @ H_i, out_h, out_w
+        )
+        warped_images.append(warped_img)
+        warped_masks.append(valid_mask)
+
+    img = average_blend_panorama(warped_images, warped_masks)
 
     return img, overlap
